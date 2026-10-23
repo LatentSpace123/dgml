@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import re
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -1009,6 +1011,53 @@ def test_convert_batch_skips_failed_document(
     )
     assert set(out) == {"good.pdf"}  # bad.pdf dropped; the batch did not abort
     assert "hello" in out["good.pdf"]
+
+
+_JOB_ID: contextvars.ContextVar[str] = contextvars.ContextVar("test_job_id", default="-")
+
+
+@pytest.mark.parametrize("max_parallel_docs", [1, 2])
+def test_convert_batch_transcribes_in_the_callers_context(
+    monkeypatch: pytest.MonkeyPatch, max_parallel_docs: int
+) -> None:
+    """Each document is transcribed in its own copy of the caller's context, on
+    a thread pool or (one worker) inline: it sees what the caller bound (a job
+    id its log handler stamps on every record), and what one document binds
+    reaches neither the next document nor the caller."""
+    from dgml_core.generation import pipeline as pl
+
+    monkeypatch.setattr(
+        "dgml_core.generation.document.load_document_as_pdf",
+        lambda path, *, converters: b"%PDF-",
+    )
+    seen: dict[str, tuple[str, bool]] = {}
+
+    def fake_transcribe(pdf_bytes: bytes, *, doc_name: str, **kw: object) -> list[Block]:
+        on_main = threading.current_thread() is threading.main_thread()
+        seen[doc_name] = (_JOB_ID.get(), on_main)
+        _JOB_ID.set(doc_name)
+        return [Block(id="b1", structure="p", text="hello", concept="Greeting")]
+
+    monkeypatch.setattr(pl, "transcribe_document", fake_transcribe)
+    monkeypatch.setattr(pl, "label_documents", lambda docs, **kw: [])
+
+    token = _JOB_ID.set("job-42")
+    try:
+        pl.convert_batch(
+            ["a.pdf", "b.pdf"],
+            options=pl.ConvertOptions(
+                model="anthropic/claude-haiku-4-5",
+                label_model="anthropic/claude-sonnet-4-6",
+                dgml_header="<dg:chunk>",
+                max_parallel_docs=max_parallel_docs,
+            ),
+        )
+        assert _JOB_ID.get() == "job-42"
+    finally:
+        _JOB_ID.reset(token)
+
+    inline = max_parallel_docs == 1
+    assert seen == {"a.pdf": ("job-42", inline), "b.pdf": ("job-42", inline)}
 
 
 def test_convert_batch_streams_to_sink_without_accumulating(
@@ -2523,7 +2572,7 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
 ) -> None:
     """A chunk whose JSON reply is unparseable is bisected until each block is
     labeled, instead of dropping the whole chunk."""
-    from dgml_core.generation.label import _label_chunk_steps
+    from dgml_core.generation.label import _ChunkEffects, _label_chunk_steps
 
     chunk = [_b("p", f"p{i}", text=f"clause number {i}") for i in range(4)]
     calls = {"n": 0}
@@ -2537,13 +2586,13 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
         return json.dumps({"labels": {ids[0]: {"concept": "Revenue"}}})
 
     monkeypatch.setattr(llm, "call", fake_call)
-    warnings: list[str] = []
+    effects = _ChunkEffects()
+    warnings = effects.warnings
     config = llm.LLMConfig(model="anthropic/claude-haiku-4-5")
     err = llm.drive(
         _label_chunk_steps(
             "doc.pdf",
             chunk,
-            {},
             [],
             config=config,
             cache_dir=None,
@@ -2551,9 +2600,8 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
             log=lambda *_: None,
             stem="doc",
             label_tag="c01",
-            warnings=warnings,
+            effects=effects,
             vocab=OPEN_VOCAB,
-            off_schema=[],
         ),
         config,
     )
@@ -2566,7 +2614,7 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
 def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A call-level error must not split (it fails at any size) — retry once and
     warn, bounding calls to 2."""
-    from dgml_core.generation.label import _label_chunk_steps
+    from dgml_core.generation.label import _ChunkEffects, _label_chunk_steps
 
     chunk = [_b("p", f"p{i}", text=f"clause {i}") for i in range(8)]
     calls = {"n": 0}
@@ -2576,13 +2624,13 @@ def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatc
         raise RuntimeError("provider down")
 
     monkeypatch.setattr(llm, "call", boom)
-    warnings: list[str] = []
+    effects = _ChunkEffects()
+    warnings = effects.warnings
     config = llm.LLMConfig(model="anthropic/claude-haiku-4-5")
     err = llm.drive(
         _label_chunk_steps(
             "doc.pdf",
             chunk,
-            {},
             [],
             config=config,
             cache_dir=None,
@@ -2590,9 +2638,8 @@ def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatc
             log=lambda *_: None,
             stem="doc",
             label_tag="c01",
-            warnings=warnings,
+            effects=effects,
             vocab=OPEN_VOCAB,
-            off_schema=[],
         ),
         config,
     )
