@@ -418,7 +418,11 @@ def extract_text_digital(
                 merged = list(words)
                 try:
                     added = merge_form_field_words(
-                        merged, form_fields[page_num], page_h_pts=page_h_pts, dpi=dpi
+                        merged,
+                        form_fields[page_num],
+                        page_h_pts=page_h_pts,
+                        scale_x=scale_x,
+                        scale_y=scale_y,
                     )
                 except Exception as exc:
                     logger.warning(

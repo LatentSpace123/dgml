@@ -37,6 +37,7 @@ from dgml_core.form_fields import (
     form_field_words,
     merge_form_field_words,
 )
+from dgml_core.pages import DEFAULT_PAGE_IMAGE_SPEC
 from dgml_core.text_extraction import PageTextDefect, extract_text_digital
 from dgml_core.textmatch import Word, fuzzy_norm
 from dgml_core.xml_grounding import _page_baseline
@@ -279,6 +280,40 @@ def test_filled_text_fields_become_words_in_their_widget(tmp_path: Path) -> None
     assert all(w["s"]["sz"] == 12.0 for w in content)
     form = words[2:4] + words[6:]
     assert not any("s" in w for w in form)
+
+
+def test_form_words_share_the_content_words_pixel_space_on_a_refit_page(
+    tmp_path: Path,
+) -> None:
+    """At 600 dpi a letter page renders past the stored image's longest edge
+    and is scaled down to fit it. The field's words land in that same pixel
+    space as the page's content words: in the widget, on the label's line."""
+    pdf = tmp_path / "form.pdf"
+    _write_form_pdf(
+        pdf,
+        [
+            Page(
+                content="BT /F1 12 Tf 72 696 Td (Name:) Tj ET",
+                fields=[Field(NAME, "Jane Example", _ap("Jane Example"))],
+            )
+        ],
+    )
+    out = tmp_path / "page_text"
+    extract_text_digital(pdf, out, file_id="f", dpi=600)
+    payload = json.loads((out / "page_1.json").read_text())
+    words = payload["words"]
+
+    rendered = (round(PAGE_W * 600 / 72), round(PAGE_H * 600 / 72))
+    stored = (payload["width"], payload["height"])
+    assert stored == DEFAULT_PAGE_IMAGE_SPEC.fit(*rendered) != rendered  # the page was refit
+    # Pixels per point of the stored image, from its own size.
+    sx, sy = stored[0] / PAGE_W, stored[1] / PAGE_H
+    name_px = (NAME[0] * sx, (PAGE_H - NAME[3]) * sy, NAME[2] * sx, (PAGE_H - NAME[1]) * sy)
+
+    assert [w["t"] for w in words] == ["Name", ":", "Jane", "Example"]
+    assert all(_inside(w["l"], name_px) for w in words[2:])
+    label, value = words[0]["l"], words[2]["l"]
+    assert abs((label[1] + label[3]) / 2 - (value[1] + value[3]) / 2) < 10
 
 
 def _baseline(words: list[dict[str, Any]]) -> float | None:
@@ -703,17 +738,18 @@ def test_prorated_words_when_the_appearance_text_is_unreadable() -> None:
 def test_merge_skips_a_value_the_page_already_prints() -> None:
     rect = (100.0, 500.0, 300.0, 520.0)
     fw = FieldWords(rect=rect, words=[("ACME", (102.0, 504.0, 140.0, 516.0))])
+    page = {"page_h_pts": 792.0, "scale_x": SCALE, "scale_y": SCALE}
     printed = [{"t": "acme", "l": [430, 1137, 580, 1183]}]
-    assert merge_form_field_words(printed, [fw], page_h_pts=792, dpi=DPI) == 0
+    assert merge_form_field_words(printed, [fw], **page) == 0
     elsewhere = [{"t": "ACME", "l": [10, 10, 50, 50]}]
-    assert merge_form_field_words(elsewhere, [fw], page_h_pts=792, dpi=DPI) == 1
+    assert merge_form_field_words(elsewhere, [fw], **page) == 1
     assert elsewhere[-1]["t"] == "ACME"
     # On the field's line, but left of the field: not inside it.
     beside = [{"t": "ACME", "l": [10, 1137, 300, 1183]}]
-    assert merge_form_field_words(beside, [fw], page_h_pts=792, dpi=DPI) == 1
+    assert merge_form_field_words(beside, [fw], **page) == 1
     # A second widget drawing the same value at the same place adds nothing.
     twice = [{"t": "ACME", "l": [10, 10, 50, 50]}]
-    assert merge_form_field_words(twice, [fw, fw], page_h_pts=792, dpi=DPI) == 1
+    assert merge_form_field_words(twice, [fw, fw], **page) == 1
 
 
 LIST_BOX = (150.0, 560.0, 400.0, 600.0)
@@ -883,15 +919,15 @@ def test_fields_that_follow_the_same_word_read_left_to_right_then_down(tmp_path:
 
 
 def _field_at(text: str, box_px: list[int]) -> FieldWords:
-    """A one-word field drawn at ``box_px`` on a page read at 72 dpi (one
-    pixel per point) that is 1000 pt tall."""
+    """A one-word field drawn at ``box_px`` on a page read at one pixel per
+    point that is 1000 pt tall."""
     left, top, right, bottom = box_px
     box = (float(left), 1000.0 - bottom, float(right), 1000.0 - top)
     return FieldWords(rect=box, words=[(text, box)])
 
 
 def _merged(words: list[dict[str, Any]], fields: list[FieldWords]) -> list[str]:
-    merge_form_field_words(words, fields, page_h_pts=1000, dpi=72)
+    merge_form_field_words(words, fields, page_h_pts=1000, scale_x=1.0, scale_y=1.0)
     return [w["t"] for w in words]
 
 

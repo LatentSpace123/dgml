@@ -178,11 +178,13 @@ def merge_form_field_words(
     fields: list[FieldWords],
     *,
     page_h_pts: float,
-    dpi: int,
+    scale_x: float,
+    scale_y: float,
 ) -> int:
     """Insert the words of ``fields`` into one page's ``words`` (the page_text
     JSON shape, page content words in pdfminer's reading order) and return how
-    many were added.
+    many were added. ``page_h_pts``, ``scale_x`` and ``scale_y`` place the
+    field boxes in the page image's pixels, as the content words were placed.
 
     A field is skipped when the words already on the page whose centre lies
     in the field rectangle spell the field's text (letters and digits,
@@ -201,7 +203,9 @@ def merge_form_field_words(
     # the end of the page.
     after: dict[int, list[list[dict[str, Any]]]] = {}
     for field in fields:
-        rect_px = _pts_box_to_pixel_lt_rb(*field.rect, page_h_pts=page_h_pts, dpi=dpi)
+        rect_px = _pts_box_to_pixel_lt_rb(
+            *field.rect, page_h_pts=page_h_pts, scale_x=scale_x, scale_y=scale_y
+        )
         if rect_px is None:
             continue
         field_text = _alnum("".join(text for text, _ in field.words))
@@ -209,7 +213,9 @@ def merge_form_field_words(
             continue
         block: list[dict[str, Any]] = []
         for text, box_pts in field.words:
-            box = _pts_box_to_pixel_lt_rb(*box_pts, page_h_pts=page_h_pts, dpi=dpi)
+            box = _pts_box_to_pixel_lt_rb(
+                *box_pts, page_h_pts=page_h_pts, scale_x=scale_x, scale_y=scale_y
+            )
             if box is not None:
                 block.append({"t": text, "l": list(box)})
         if not block:
